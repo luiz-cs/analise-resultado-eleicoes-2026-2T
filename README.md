@@ -1,0 +1,1 @@
+# analise-resultado-eleicoes-2026-2T

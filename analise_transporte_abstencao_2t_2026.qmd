@@ -1,0 +1,467 @@
+---
+title: "Eleições 2026 — 2º turno presidencial"
+subtitle: "Efeitos da frota de ônibus sobre a abstenção"
+author: "Roteiro de análise reproduzível com dados abertos do TSE"
+date: today
+date-format: "DD/MM/YYYY"
+lang: pt-BR
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+    theme: cosmo
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Leia primeiro
+
+::: {.callout-warning}
+## Este documento roda, por padrão, com dados FICTÍCIOS
+
+Com `USAR_SIMULACAO <- TRUE` (padrão), todos os números, gráficos e conclusões gerados abaixo vêm de dados **inventados** para testar o código. Eles **não dizem nada** sobre a eleição real. Para analisar o pleito de verdade, baixe os arquivos do TSE, monte o arquivo de frota (@sec-onibus), ajuste os caminhos na seção de configuração e troque a chave para `FALSE`.
+
+O 2º turno foi realizado em 25/10/2026 (Lula × Flávio Bolsonaro, votação das 8h às 17h, horário de Brasília). Os arquivos de boletim de urna só ficam completos depois da totalização; confira a disponibilidade no portal de dados abertos antes de rodar.
+:::
+
+## Premissas que o código testa (e não assume)
+
+* **"Redução da frota de ônibus"** é uma hipótese, não um fato estabelecido. Reportagens de 19–20/10 indicam que Salvador operaria com 100% da frota de dia útil, e que São Paulo teria cerca de 6,9 mil ônibus, 40% a mais que num domingo comum, mas com programação de sábado e não de dia útil ([Diário do Transporte](https://diariodotransporte.com.br/2026/10/20/sao-paulo-tera-69-mil-onibus-gratuitos-no-segundo-turno-das-eleicoes-com-aumento-de-40-na-frota-outras-cidades-tambem-terao-tarifa-zero/); [Correio](https://www.correio24horas.com.br/eleicoes/onibus-brt-e-elevador-lacerda-salvador-tera-transporte-publico-gratuito-no-segundo-turno-das-eleicoes-1026)). Por isso o código calcula **dois índices**: a queda em relação ao dia útil e a variação em relação a um domingo comum.
+* Correlação não é causalidade. Os testes medem **associação** e fazem exercícios de **sensibilidade** (quanto o resultado nacional poderia mudar), não provam efeito causal.
+* Este é um documento independente. A análise do horário de fechamento das urnas está em `analise_fechamento_urnas_2t_2026.qmd`.
+
+# Configuração
+
+```{r}
+#| label: setup
+library(tidyverse)   # dplyr, ggplot2, readr, tidyr, purrr, stringr
+library(broom)       # tabelas de modelos
+library(sandwich)    # erros-padrão robustos
+library(lmtest)      # coeftest/coefci
+library(glue)
+
+options(scipen = 999, dplyr.summarise.inform = FALSE)
+theme_set(theme_minimal(base_size = 12))
+
+# Instalação: install.packages(c("tidyverse", "broom", "sandwich", "lmtest", "glue"))
+```
+
+```{r}
+#| label: config
+# ===================== PARÂMETROS QUE VOCÊ PODE ALTERAR =====================
+
+USAR_SIMULACAO <- TRUE   # TRUE = dados fictícios | FALSE = lê os arquivos reais abaixo
+
+# --- Caminhos dos arquivos (baixe em https://dadosabertos.tse.jus.br) ---------
+DIR_DADOS <- "dados"
+
+# Boletim de Urna (BU) do 2º turno, usado aqui só para somar os votos por zona.
+# O TSE publica um ZIP por UF (padrão em edições anteriores:
+# bweb_<turno>t_<UF>_<DDMMAAAAHHMM>.zip). Descompacte os CSV em DIR_DADOS:
+# o padrão abaixo lê bweb_2t_BR_2026.csv ou vários bweb_2t_<UF>_*.csv de uma vez.
+ARQS_BU <- list.files(DIR_DADOS, pattern = "^bweb_2t_.*\\.csv$", full.names = TRUE)
+
+# Detalhe da votação por município/zona (aptos, comparecimento, abstenções)
+ARQ_DETALHE_ZONA <- file.path(DIR_DADOS, "detalhe_votacao_munzona_2026_BR.csv")
+
+# Perfil do eleitorado (usado para controlar a % de eleitores com voto facultativo)
+ARQ_PERFIL <- file.path(DIR_DADOS, "perfil_eleitorado_2026.csv")
+
+# Frota de ônibus por zona eleitoral (você monta; formato descrito na seção "Frota de ônibus")
+ARQ_ONIBUS <- file.path(DIR_DADOS, "frota_onibus_2026_2t.csv")
+
+# --- Pleito e candidatos ------------------------------------------------------
+CD_CARGO_PRESIDENTE <- "1"
+NR_CAND_A <- "13"; NM_A <- "Lula (PT)"
+NR_CAND_B <- "22"; NM_B <- "Flávio Bolsonaro (PL)"
+
+# --- Municípios ---------------------------------------------------------------
+MUNICIPIOS_ANALISE <- c("SÃO PAULO", "SALVADOR")  # nomes como no TSE (maiúsculas, com acento)
+MUNICIPIOS_EXTRA   <- character(0)                 # ex.: c("RIO DE JANEIRO", "RECIFE")
+
+ALFA <- 0.05
+
+# Só para o modo simulação: margem nacional FICTÍCIA (votos A − votos B)
+MARGEM_NACIONAL_SIMULADA <- 1500000
+# =============================================================================
+
+fmt   <- function(x, d = 2) format(round(x, d), decimal.mark = ",", nsmall = d, big.mark = ".")
+fmt_p <- function(p) ifelse(p < 0.001, "< 0,001", format(round(p, 3), decimal.mark = ",", nsmall = 3))
+```
+
+# Importação dos dados
+
+## Funções de leitura (arquivos reais)
+
+Os CSV do TSE usam `;` como separador, codificação Latin-1 e `#NULO#`/`#NE#` para faltantes. Os nomes de colunas abaixo seguem a documentação de edições anteriores (2022); **confira o LEIAME de 2026** e ajuste se algum nome mudou. A função `checar_colunas()` avisa exatamente o que faltou.
+
+```{r}
+#| label: funcoes-leitura
+ler_tse <- function(arquivos, colunas = NULL) {
+  map_dfr(arquivos, \(f) {
+    read_delim(
+      f, delim = ";",
+      locale    = locale(encoding = "latin1", decimal_mark = ","),
+      col_types = cols(.default = col_character()),
+      col_select = if (is.null(colunas)) everything() else any_of(colunas),
+      na = c("", "#NULO#", "#NE#"), progress = FALSE
+    )
+  }) |>
+    rename_with(str_to_lower)
+}
+
+checar_colunas <- function(df, esperadas, nome) {
+  faltam <- setdiff(esperadas, names(df))
+  if (length(faltam)) {
+    stop(glue("Em '{nome}' faltam as colunas: {paste(faltam, collapse = ', ')}. ",
+              "Confira o LEIAME do TSE para 2026 e ajuste os vetores de colunas."))
+  }
+  invisible(df)
+}
+
+norm_zona <- function(x) as.character(as.integer(x))   # remove zeros à esquerda
+```
+
+Para a parte de transporte o BU é usado apenas para somar os votos de cada candidato por zona (necessário ao exercício "o resultado muda?"):
+
+```{r}
+#| label: importar-bu-real
+importar_bu_real <- function() {
+  if (!length(ARQS_BU)) stop("Nenhum arquivo bweb_2t_*.csv encontrado em '", DIR_DADOS, "'.")
+
+  cols <- c("SG_UF", "CD_MUNICIPIO", "NM_MUNICIPIO", "NR_ZONA", "CD_CARGO", "NR_VOTAVEL", "QT_VOTOS")
+  bu <- ler_tse(ARQS_BU, cols)
+  checar_colunas(bu, tolower(cols), "Boletim de Urna")
+
+  bu |>
+    filter(cd_cargo == CD_CARGO_PRESIDENTE) |>
+    mutate(qt_votos = as.numeric(qt_votos),
+           nr_zona  = norm_zona(nr_zona),
+           tipo = case_when(nr_votavel == NR_CAND_A ~ "A",
+                            nr_votavel == NR_CAND_B ~ "B",
+                            TRUE ~ "outros")) |>   # 95 = branco, 96 = nulo
+    group_by(sg_uf, cd_municipio, nm_municipio, nr_zona) |>
+    summarise(votos_a = sum(qt_votos[tipo == "A"]),
+              votos_b = sum(qt_votos[tipo == "B"]),
+              .groups = "drop")
+}
+```
+
+## Frota de ônibus (formato esperado) e tabela por zona {#sec-onibus}
+
+Não existe um arquivo único e padronizado de frota por zona eleitoral. Você precisa montar um CSV (`ARQ_ONIBUS`) com **uma linha por zona** e estas colunas:
+
+| coluna | descrição |
+|---|---|
+| `cd_municipio` | código do município **no padrão TSE** (diferente do código IBGE) |
+| `nr_zona` | número da zona eleitoral |
+| `frota_eleicao` | veículos em operação no domingo da eleição (25/10/2026), alocados à zona |
+| `frota_ref_diautil` | média de veículos num dia útil de referência, mesma alocação |
+| `frota_ref_domingo` | média de veículos num domingo comum, mesma alocação |
+
+Fontes típicas: GTFS e API Olho Vivo da SPTrans (São Paulo) e dados abertos da Prefeitura/Semob (Salvador). Para alocar a frota às zonas, cruze as linhas/paradas com a localização dos locais de votação (arquivo de locais de votação do TSE, se trouxer coordenadas) por distância ou área de influência.
+
+::: {.callout-important}
+## Precisa haver variação *dentro* do município
+Se você só tiver **um número por município**, a amostra efetiva é de 2 pontos (São Paulo e Salvador) e nenhuma regressão é informativa. O ideal é a frota **por zona** (ou por local de votação, agregado depois). Outra opção forte é comparar 1º e 2º turnos: diferença da abstenção por zona contra diferença da frota por zona.
+:::
+
+```{r}
+#| label: importar-zonas-real
+importar_zonas_real <- function(votos_bu) {
+  # --- aptos e abstenções por zona (2º turno, presidente) ---
+  det <- ler_tse(ARQ_DETALHE_ZONA,
+                 c("SG_UF", "CD_MUNICIPIO", "NM_MUNICIPIO", "NR_ZONA", "NR_TURNO",
+                   "CD_CARGO", "QT_APTOS", "QT_COMPARECIMENTO", "QT_ABSTENCOES"))
+  checar_colunas(det, c("nr_turno", "cd_cargo", "qt_aptos", "qt_abstencoes"), "Detalhe por zona")
+  det <- det |>
+    filter(nr_turno == "2", cd_cargo == CD_CARGO_PRESIDENTE) |>
+    mutate(nr_zona = norm_zona(nr_zona), across(starts_with("qt_"), as.numeric)) |>
+    group_by(sg_uf, cd_municipio, nm_municipio, nr_zona) |>
+    summarise(aptos = sum(qt_aptos), abstencoes = sum(qt_abstencoes), .groups = "drop")
+
+  # --- % de eleitores com voto facultativo (16–17 anos e 70+) ---
+  perfil <- ler_tse(ARQ_PERFIL, c("CD_MUNICIPIO", "NR_ZONA", "DS_FAIXA_ETARIA", "QT_ELEITORES_PERFIL"))
+  checar_colunas(perfil, c("ds_faixa_etaria", "qt_eleitores_perfil"), "Perfil do eleitorado")
+  perfil <- perfil |>
+    mutate(nr_zona = norm_zona(nr_zona),
+           qt = as.numeric(qt_eleitores_perfil),
+           facult = str_detect(ds_faixa_etaria, "^(16|17|[7-9][0-9]|100)")) |>
+    group_by(cd_municipio, nr_zona) |>
+    summarise(pct_facultativos = 100 * sum(qt[facult], na.rm = TRUE) / sum(qt, na.rm = TRUE),
+              .groups = "drop")
+
+  # --- votos por zona, agregados a partir do BU ---
+  votos_zona <- votos_bu |>
+    group_by(cd_municipio, nr_zona) |>
+    summarise(votos_a = sum(votos_a), votos_b = sum(votos_b), .groups = "drop")
+
+  # --- frota ---
+  onibus <- read_csv(ARQ_ONIBUS, col_types = cols(cd_municipio = "c", nr_zona = "c", .default = "d")) |>
+    mutate(nr_zona = norm_zona(nr_zona))
+  checar_colunas(onibus, c("cd_municipio", "nr_zona", "frota_eleicao",
+                           "frota_ref_diautil", "frota_ref_domingo"), "Frota de ônibus")
+
+  det |>
+    left_join(perfil,     by = c("cd_municipio", "nr_zona")) |>
+    left_join(votos_zona, by = c("cd_municipio", "nr_zona")) |>
+    inner_join(onibus,    by = c("cd_municipio", "nr_zona")) |>
+    mutate(
+      queda_frota_pct       = 100 * (1 - frota_eleicao / frota_ref_diautil),  # >0 = menos ônibus que dia útil
+      var_frota_domingo_pct = 100 * (frota_eleicao / frota_ref_domingo - 1),  # >0 = mais ônibus que domingo comum
+      pct_a_validos         = 100 * votos_a / (votos_a + votos_b)
+    ) |>
+    select(sg_uf, cd_municipio, nm_municipio, nr_zona, aptos, abstencoes, pct_facultativos,
+           queda_frota_pct, var_frota_domingo_pct, votos_a, votos_b, pct_a_validos)
+}
+```
+
+## Simulação (dados fictícios para testar o código)
+
+A simulação embute de propósito (i) diferenças de base entre municípios e (ii) um efeito pequeno da frota na abstenção, para mostrar por que os controles importam. **Todos os parâmetros são inventados.**
+
+```{r}
+#| label: simulacao
+simular_zonas <- function(efeito_sim = 0.03, seed = 2026) {
+  set.seed(seed)
+  tribble(
+    ~sg_uf, ~nm_municipio,     ~n_zonas, ~aptos_zona, ~queda_media, ~frac_dom,
+    "SP",   "SÃO PAULO",       58,       190000,      45,           0.40,
+    "BA",   "SALVADOR",        22,       100000,       3,           0.50,
+    "RJ",   "RIO DE JANEIRO",  40,       120000,      25,           0.45,
+    "MG",   "BELO HORIZONTE",  25,        90000,      20,           0.45,
+    "PE",   "RECIFE",          15,        80000,      10,           0.50
+  ) |>
+    mutate(cd_municipio = sprintf("SIM%03d", row_number()),
+           abst_base    = runif(n(), 15, 25),
+           pct_a_base   = runif(n(), 40, 60)) |>
+    uncount(n_zonas, .id = "nr_zona") |>
+    mutate(
+      nr_zona          = as.character(nr_zona),
+      aptos            = round(aptos_zona * runif(n(), .6, 1.4)),
+      pct_facultativos = pmin(35, pmax(8, rnorm(n(), 20, 4))),
+      queda_frota_pct  = pmin(80, pmax(-10, rnorm(n(), queda_media, 8))),
+      taxa_sim         = abst_base + 0.35 * (pct_facultativos - 20) +
+                         efeito_sim * queda_frota_pct + rnorm(n(), 0, 1.2),
+      abstencoes       = round(aptos * pmin(60, pmax(3, taxa_sim)) / 100),
+      var_frota_domingo_pct = 100 * ((1 - queda_frota_pct / 100) / frac_dom - 1),
+      pct_a_validos    = pmin(90, pmax(10, rnorm(n(), pct_a_base, 5))),
+      validos          = round((aptos - abstencoes) * 0.95),
+      votos_a          = round(validos * pct_a_validos / 100),
+      votos_b          = validos - votos_a
+    ) |>
+    select(sg_uf, cd_municipio, nm_municipio, nr_zona, aptos, abstencoes, pct_facultativos,
+           queda_frota_pct, var_frota_domingo_pct, votos_a, votos_b, pct_a_validos)
+}
+```
+
+## Carregar
+
+```{r}
+#| label: carregar
+if (USAR_SIMULACAO) {
+  zonas <- simular_zonas()
+  MARGEM_NACIONAL <- MARGEM_NACIONAL_SIMULADA
+} else {
+  votos_bu <- importar_bu_real()
+  zonas    <- importar_zonas_real(votos_bu)
+  # Só é a margem nacional se todos os BUs (todas as UFs + exterior) foram carregados
+  MARGEM_NACIONAL <- sum(votos_bu$votos_a, na.rm = TRUE) - sum(votos_bu$votos_b, na.rm = TRUE)
+}
+
+cat("Zonas:", nrow(zonas), "\n")
+cat("Margem nacional (", NM_A, " − ", NM_B, "): ", format(MARGEM_NACIONAL, big.mark = "."),
+    if (USAR_SIMULACAO) " [VALOR FICTÍCIO]" else "", "\n", sep = "")
+glimpse(zonas)
+```
+
+# Frota de ônibus e abstenção
+
+## Dados e definição dos índices
+
+* `queda_frota_pct` = `100 × (1 − frota_eleição / frota_dia_útil)`. Valor positivo = menos ônibus que num dia útil. É a medida da hipótese "queda na circulação".
+* `var_frota_domingo_pct` = variação em relação a um domingo comum. Valor positivo = mais ônibus que o normal de domingo. Mostra se a eleição teve **reforço** apesar de ficar abaixo do dia útil.
+* `taxa_abst_pp` = abstenções ÷ aptos × 100.
+
+```{r}
+#| label: p1-dados
+zonas_analise <- zonas |>
+  filter(str_to_upper(nm_municipio) %in% c(MUNICIPIOS_ANALISE, MUNICIPIOS_EXTRA)) |>
+  mutate(across(c(aptos, abstencoes), as.numeric),
+         taxa_abst_pp = 100 * abstencoes / aptos)
+
+zonas_analise |>
+  group_by(Município = nm_municipio) |>
+  summarise(
+    Zonas = n(),
+    `Eleitores aptos` = sum(aptos),
+    `Abstenção (%)` = weighted.mean(taxa_abst_pp, aptos),
+    `Queda vs. dia útil (p.p.)` = weighted.mean(queda_frota_pct, aptos),
+    `Variação vs. domingo comum (%)` = weighted.mean(var_frota_domingo_pct, aptos)
+  ) |>
+  knitr::kable(digits = 1, format.args = list(big.mark = ".", decimal.mark = ","))
+```
+
+## Correlação
+
+```{r}
+#| label: p1-correlacao
+cor_p <- cor.test(~ queda_frota_pct + taxa_abst_pp, data = zonas_analise)
+cor_s <- cor.test(~ queda_frota_pct + taxa_abst_pp, data = zonas_analise,
+                  method = "spearman", exact = FALSE)
+
+tibble(
+  Método = c("Pearson", "Spearman"),
+  Coeficiente = c(cor_p$estimate, cor_s$estimate),
+  `IC 95% inf.` = c(cor_p$conf.int[1], NA),
+  `IC 95% sup.` = c(cor_p$conf.int[2], NA),
+  `p-valor` = c(cor_p$p.value, cor_s$p.value)
+) |>
+  knitr::kable(digits = 3, format.args = list(decimal.mark = ","))
+```
+
+## Regressão linear
+
+O modelo pedido é o **simples** (`m1`). Como São Paulo e Salvador diferem em muitos fatores além da frota, ele é comparado com um modelo ajustado (`m2`): pondera por eleitores aptos, controla a % de eleitores com voto facultativo (16–17 anos e 70+, que se abstêm mais) e inclui efeito fixo de município (compara zonas *dentro* do mesmo município).
+
+```{r}
+#| label: p1-regressao
+resumir_modelo <- function(modelo, termo = "queda_frota_pct") {
+  if (is.na(coef(modelo)[termo])) {
+    return(tibble(estimativa_pp = NA_real_, ep_robusto = NA_real_, p_valor = NA_real_,
+                  ic_inf = NA_real_, ic_sup = NA_real_, n = nobs(modelo), r2 = NA_real_))
+  }
+  vc <- vcovHC(modelo, type = "HC3")
+  ct <- coeftest(modelo, vcov. = vc)
+  ci <- coefci(modelo, vcov. = vc, level = 1 - ALFA)
+  tibble(estimativa_pp = ct[termo, "Estimate"], ep_robusto = ct[termo, "Std. Error"],
+         p_valor = ct[termo, "Pr(>|t|)"], ic_inf = ci[termo, 1], ic_sup = ci[termo, 2],
+         n = nobs(modelo), r2 = summary(modelo)$r.squared)
+}
+
+m1 <- lm(taxa_abst_pp ~ queda_frota_pct, data = zonas_analise)
+m2 <- lm(taxa_abst_pp ~ queda_frota_pct + pct_facultativos + factor(cd_municipio),
+         data = zonas_analise, weights = aptos)
+
+if (is.na(coef(m2)["queda_frota_pct"])) {
+  warning("No modelo m2 a frota não varia dentro dos municípios (colinear com o efeito fixo). ",
+          "Use frota por zona ou compare 1º e 2º turnos.")
+}
+
+tab_modelos <- bind_rows(
+  `m1: simples` = resumir_modelo(m1),
+  `m2: ajustado (peso, facultativos, município)` = resumir_modelo(m2),
+  .id = "Modelo"
+)
+
+tab_modelos |>
+  knitr::kable(digits = 3, format.args = list(decimal.mark = ","),
+               col.names = c("Modelo", "Efeito (p.p. de abstenção por p.p. de queda)",
+                             "EP robusto (HC3)", "p-valor", "IC95% inf.", "IC95% sup.", "N", "R²"))
+```
+
+```{r}
+#| label: p1-leitura
+#| results: asis
+r_ref <- if (is.na(tab_modelos$estimativa_pp[2])) tab_modelos[1, ] else tab_modelos[2, ]
+cat(glue(
+  "**Leitura automática ({r_ref$Modelo}).** Cada 10 p.p. a menos de frota em relação ao dia útil ",
+  "associa-se a **{fmt(10 * r_ref$estimativa_pp)} p.p.** de abstenção ",
+  "(IC 95%: {fmt(10 * r_ref$ic_inf)} a {fmt(10 * r_ref$ic_sup)}; p = {fmt_p(r_ref$p_valor)}). ",
+  "{if (!is.na(r_ref$p_valor) && r_ref$p_valor < ALFA) 'A associação é estatisticamente significativa' else 'A associação não é estatisticamente significativa'} ",
+  "ao nível de {ALFA * 100}%. Isso descreve associação entre zonas, não prova causalidade."
+))
+```
+
+## Gráfico de dispersão
+
+```{r}
+#| label: p1-grafico
+#| fig-width: 9
+#| fig-height: 5.5
+ggplot(zonas_analise, aes(x = queda_frota_pct, y = taxa_abst_pp)) +
+  geom_point(aes(size = aptos, colour = nm_municipio), alpha = .65) +
+  geom_smooth(method = "lm", formula = y ~ x, se = TRUE, colour = "black", linewidth = .9) +
+  geom_smooth(aes(colour = nm_municipio), method = "lm", formula = y ~ x,
+              se = FALSE, linewidth = .5, linetype = "dashed") +
+  scale_size_area(max_size = 6, labels = scales::label_number(big.mark = ".")) +
+  labs(
+    title = "Queda da frota de ônibus e abstenção por zona eleitoral — 2º turno 2026",
+    subtitle = if (USAR_SIMULACAO) "DADOS FICTÍCIOS — apenas demonstração do código" else NULL,
+    x = "Queda da frota em relação a um dia útil (p.p.; negativo = frota maior que a de dia útil)",
+    y = "Taxa de abstenção (%)",
+    colour = "Município", size = "Eleitores aptos",
+    caption = "Linha preta: ajuste linear geral. Tracejadas: ajuste dentro de cada município."
+  )
+```
+
+## O resultado do pleito muda?
+
+Exercício de sensibilidade: usa o efeito estimado para calcular quantos eleitores a mais deixariam de votar por causa da queda da frota (em relação a um cenário sem queda) nas zonas analisadas, e compara com a margem nacional. Dois cenários de alocação desses votos:
+
+* **Proporcional:** quem deixou de votar votaria como a zona (`% de válidos de A e B`).
+* **Extremo:** todos votariam no mesmo candidato (limite superior do impacto possível).
+
+O efeito estimado é usado em duas versões: o valor pontual e o limite superior do IC.
+
+```{r}
+#| label: p1-impacto
+impacto <- function(beta_pp, rotulo) {
+  d <- zonas_analise |>
+    mutate(abst_exc = pmax(beta_pp, 0) * pmax(queda_frota_pct, 0) / 100 * aptos,
+           dif_prop = (2 * pct_a_validos - 100) / 100)          # (A − B) / válidos da zona
+
+  abst_total  <- sum(d$abst_exc)
+  delta_prop  <- sum(d$abst_exc * d$dif_prop)                  # variação da margem (A − B), cenário proporcional
+
+  tibble(
+    Cenário = rotulo,
+    `Efeito (p.p.)` = beta_pp,
+    `Abstenções atribuíveis` = abst_total,
+    `Δ margem, alocação proporcional` = delta_prop,
+    `% da margem nacional (proporcional)` = 100 * abs(delta_prop) / abs(MARGEM_NACIONAL),
+    `% da margem nacional (extremo)` = 100 * abst_total / abs(MARGEM_NACIONAL),
+    `Inverteria o vencedor (proporcional)?` = sign(MARGEM_NACIONAL + delta_prop) != sign(MARGEM_NACIONAL),
+    `Inverteria o vencedor (extremo)?` = abst_total > abs(MARGEM_NACIONAL)
+  )
+}
+
+bind_rows(
+  impacto(r_ref$estimativa_pp, "Estimativa pontual"),
+  impacto(r_ref$ic_sup,        "Limite superior do IC 95%")
+) |>
+  knitr::kable(digits = 1, format.args = list(big.mark = ".", decimal.mark = ","))
+```
+
+::: {.callout-note}
+## Como ler
+Se "Abstenções atribuíveis" for muito menor que a margem nacional, mesmo o cenário extremo não altera o vencedor. Se for maior, o cenário extremo *poderia* alterar, mas é um limite improvável (exigiria que todos os ausentes votassem de forma uniforme). O exercício cobre só as zonas analisadas e supõe que o efeito estimado é causal; se não for, o impacto real é menor.
+:::
+
+# Limitações e checklist
+
+**Limitações**
+
+* **Falácia ecológica:** associações entre zonas não valem automaticamente para indivíduos.
+* **Variáveis omitidas:** renda, clima, distância ao local de votação, tarifa zero e eventos do dia afetam a abstenção. O modelo ajustado controla só o que está no `perfil_eleitorado`.
+* **Frota ≠ acesso:** o número de veículos não mede tempo de espera, lotação nem a demanda adicional gerada pela gratuidade.
+* **Alocação da frota às zonas:** a frota por zona depende de como você cruza linhas/paradas com locais de votação; essa escolha pode mudar o resultado, vale testar mais de uma.
+* **Margem nacional:** só é a margem real se todos os BUs (todas as UFs e exterior) foram carregados.
+
+**Para rodar com dados reais**
+
+1. Baixe BU, detalhe por zona e perfil do eleitorado em <https://dadosabertos.tse.jus.br> e descompacte em `dados/`.
+2. Monte o CSV de frota (@sec-onibus).
+3. Troque `USAR_SIMULACAO` para `FALSE`; confira os nomes de colunas se alguma checagem falhar.
+4. Renderize: `quarto render analise_transporte_abstencao_2t_2026.qmd`.
+
+```{r}
+#| label: sessao
+sessionInfo()
+```

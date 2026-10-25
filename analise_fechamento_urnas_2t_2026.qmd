@@ -1,0 +1,734 @@
+---
+title: "Eleições 2026 — 2º turno presidencial"
+subtitle: "Efeitos do horário de fechamento das urnas (após as 17h)"
+author: "Roteiro de análise reproduzível com dados abertos do TSE"
+date: today
+date-format: "DD/MM/YYYY"
+lang: pt-BR
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+    theme: cosmo
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Leia primeiro
+
+::: {.callout-important}
+## Este documento baixa dados REAIS do TSE
+
+Ao renderizar, o documento consulta o portal de dados abertos do TSE, baixa os arquivos de Boletim de Urna (BU) do 2º turno (um ZIP por UF, guardados em cache na pasta `dados_tse/`) e analisa os horários de encerramento e a votação de cada seção. Não há dados simulados.
+
+* **Disponibilidade:** o TRE-PR informou que os BUs usados na totalização são publicados nos dados abertos depois que a totalização termina ([TRE-PR](https://www.tre-pr.jus.br/comunicacao/noticias/2026/Outubro/acompanhe-a-apuracao-das-eleicoes-2026-pela-internet)). Se os arquivos ainda não estiverem lá, o carregamento para com uma mensagem dizendo quais UFs faltam; é só renderizar de novo mais tarde.
+* **Tamanho:** os ZIPs de todas as UFs podem ocupar vários GB e o primeiro download leva tempo. Nas execuções seguintes o cache é reaproveitado.
+* **Descoberta dos links:** o endereço de cada ZIP contém a data/hora de geração, então o código consulta a API do portal para achar os links. Se essa consulta falhar, copie os endereços dos `.zip` do conjunto "Resultados 2026 – Boletim de Urna" e cole em `URLS_MANUAIS` (seção de configuração).
+:::
+
+O 2º turno foi realizado em 25/10/2026 (Lula × Flávio Bolsonaro, votação das 8h às 17h, horário de Brasília).
+
+## Premissas que o código testa (e não assume)
+
+* **"Urnas encerradas após as 17h"** costuma ser, em grande parte, um efeito do procedimento legal: quem já está na fila às 17h pode votar. O código mostra a distribuição real dos horários (@sec-diagnostico) e testa a sensibilidade ao ponto de corte (@sec-sensibilidade) antes de qualquer conclusão.
+* Diferença de votação entre grupos de seções mostra **composição** (tamanho, urbanização, perfil), não irregularidade.
+* Este é um documento independente. A análise de transporte e abstenção está em `analise_transporte_abstencao_2t_2026.qmd`.
+
+# Configuração
+
+```{r}
+#| label: setup
+library(tidyverse)   # dplyr, ggplot2, readr, lubridate, tidyr, purrr, stringr
+library(lubridate)
+library(httr2)       # download dos arquivos do TSE
+library(sandwich)    # erros-padrão robustos
+library(lmtest)      # coeftest/coefci
+library(glue)
+
+options(scipen = 999, dplyr.summarise.inform = FALSE, timeout = 3600)
+theme_set(theme_minimal(base_size = 12))
+
+# Instalação: install.packages(c("tidyverse", "httr2", "sandwich", "lmtest", "glue", "fixest"))
+# ('fixest' é opcional: só para o modelo com efeito fixo de município)
+```
+
+```{r}
+#| label: config
+# ===================== PARÂMETROS QUE VOCÊ PODE ALTERAR =====================
+
+# --- Origem dos dados (TSE – Dados Abertos) -----------------------------------
+URL_PORTAL <- "https://dadosabertos.tse.jus.br"
+# Nome do conjunto de dados, seguindo o padrão de 2020 e 2022 ("resultados-AAAA-boletim-de-urna").
+# Se não existir, o código procura sozinho um conjunto com "boletim" e "2026" no nome.
+SLUG_BU <- "resultados-2026-boletim-de-urna"
+
+DIR_DADOS              <- "dados_tse"   # cache dos downloads
+FORCAR_DOWNLOAD        <- FALSE         # TRUE = baixa de novo mesmo que o arquivo já exista
+APAGAR_CSV_EXTRAIDO    <- TRUE          # apaga o CSV depois de ler (o ZIP fica em cache)
+INCLUIR_EXTERIOR       <- FALSE         # TRUE inclui o voto no exterior ("ZZ"), que tem horários próprios
+PERMITIR_UFS_FALTANTES <- FALSE         # FALSE = para se alguma UF ainda não foi publicada
+URLS_MANUAIS           <- character(0)  # opcional: c("https://cdn.tse.jus.br/.../bweb_2t_SP_<...>.zip", ...)
+
+UFS <- c("AC","AL","AP","AM","BA","CE","DF","ES","GO","MA","MT","MS","MG","PA","PB","PR","PE",
+         "PI","RJ","RN","RS","RO","RR","SC","SP","SE","TO")
+
+# --- Pleito e candidatos ------------------------------------------------------
+LIMITE_FECHAMENTO   <- ymd_hms("2026-10-25 17:00:00", tz = "America/Sao_Paulo")
+CD_CARGO_PRESIDENTE <- "1"
+NR_CAND_A <- "13"; NM_A <- "Lula (PT)"
+NR_CAND_B <- "22"; NM_B <- "Flávio Bolsonaro (PL)"
+
+# --- Horário ------------------------------------------------------------------
+COLUNA_HORARIO     <- "dt_encerramento"  # alternativa: "dt_emissao_bu"
+HORARIO_NO_ARQUIVO <- "auto"             # "auto" (decide por UF), "brasilia" ou "local_uf"
+TOLERANCIA_MIN     <- 0                  # 0 = corte estrito às 17h00; veja a análise de sensibilidade
+MIN_SECOES_GRUPO   <- 30                 # mínimo de seções por grupo para testar dentro de uma UF
+
+ALFA <- 0.05
+# =============================================================================
+
+GRUPOS <- c("Encerradas até 17h00", "Encerradas após 17h00")
+fmt   <- function(x, d = 2) format(round(x, d), decimal.mark = ",", nsmall = d, big.mark = ".")
+fmt_p <- function(p) ifelse(p < 0.001, "< 0,001", format(round(p, 3), decimal.mark = ",", nsmall = 3))
+```
+
+# Download e importação dos dados
+
+## Descoberta e download dos arquivos
+
+O portal de dados abertos do TSE é um CKAN, que expõe uma API em `/api/3/action/`. O código lista os arquivos do conjunto "Boletim de Urna 2026", filtra os ZIPs do 2º turno (`bweb_2t_<UF>_<data-hora>.zip`), escolhe a versão mais recente de cada UF e baixa o que ainda não está no cache.
+
+```{r}
+#| label: funcoes-download
+req_tse <- function(url) {
+  request(url) |>
+    req_user_agent("analise-eleitoral-2026 (R/httr2)") |>
+    req_timeout(120) |>
+    req_retry(max_tries = 3)
+}
+
+consultar_ckan <- function(endpoint) {
+  tryCatch(
+    req_tse(glue("{URL_PORTAL}/api/3/action/{endpoint}")) |> req_perform() |> resp_body_json(),
+    error = \(e) { cat("Falha ao consultar", endpoint, ":", conditionMessage(e), "\n"); NULL }
+  )
+}
+
+urls_do_conjunto <- function(slug) {
+  r <- consultar_ckan(glue("package_show?id={slug}"))
+  if (is.null(r) || !isTRUE(r$success)) return(character(0))
+  map_chr(r$result$resources, \(x) pluck(x, "url", .default = NA_character_)) |>
+    discard(is.na) |> as.character()
+}
+
+descobrir_urls_bu <- function() {
+  if (length(URLS_MANUAIS)) return(URLS_MANUAIS)
+
+  urls <- urls_do_conjunto(SLUG_BU)
+  if (!length(urls)) {  # plano B: procurar o conjunto por palavra-chave
+    busca <- consultar_ckan("package_search?q=boletim+de+urna+2026&rows=50")
+    if (!is.null(busca) && isTRUE(busca$success)) {
+      slugs <- map_chr(busca$result$results, "name") |>
+        keep(\(n) str_detect(n, "2026") && str_detect(n, "boletim"))
+      urls <- as.character(unlist(map(slugs, urls_do_conjunto)))
+    }
+  }
+  unique(str_subset(urls, regex("bweb_2t_[A-Z]{2}_[0-9]+\\.zip$", ignore_case = TRUE)))
+}
+
+selecionar_urls <- function(urls) {
+  alvo <- c(UFS, if (INCLUIR_EXTERIOR) "ZZ")
+
+  tab <- tibble(
+    url    = urls,
+    uf     = str_to_upper(str_match(urls, regex("bweb_2t_([A-Z]{2})_", ignore_case = TRUE))[, 2]),
+    gerado = parse_date_time(str_extract(urls, "[0-9]{12}(?=\\.zip$)"), orders = "dmYHM",
+                             tz = "America/Sao_Paulo", quiet = TRUE)
+  ) |>
+    filter(uf %in% alvo) |>
+    group_by(uf) |>
+    slice_max(gerado, n = 1, with_ties = FALSE) |>   # versão mais recente de cada UF
+    ungroup()
+
+  faltam <- setdiff(alvo, tab$uf)
+  if (length(faltam)) {
+    msg <- glue("Arquivos do 2º turno não encontrados para: {paste(faltam, collapse = ', ')}. ",
+                "Se a totalização ainda não terminou, aguarde a publicação. ",
+                "Se já foi publicada, a consulta automática pode ter falhado: preencha URLS_MANUAIS.")
+    if (!PERMITIR_UFS_FALTANTES) stop(msg, call. = FALSE)
+    warning(msg, call. = FALSE)
+  }
+  tab
+}
+
+baixar_zip <- function(url) {
+  dir.create(DIR_DADOS, showWarnings = FALSE, recursive = TRUE)
+  destino <- file.path(DIR_DADOS, basename(url))
+  if (FORCAR_DOWNLOAD || !file.exists(destino) || file.size(destino) == 0) {
+    cat("Baixando", basename(url), "...\n")
+    parcial <- paste0(destino, ".parte")
+    req_tse(url) |> req_timeout(3600) |> req_perform(path = parcial)
+    file.rename(parcial, destino)
+  }
+  destino
+}
+```
+
+```{r}
+#| label: descobrir
+urls <- descobrir_urls_bu()
+sel  <- selecionar_urls(urls)
+
+sel |>
+  transmute(UF = uf, `Gerado em` = format(gerado, "%d/%m/%Y %H:%M"), Arquivo = basename(url)) |>
+  knitr::kable()
+```
+
+```{r}
+#| label: baixar
+zips <- map_chr(sel$url, baixar_zip)
+cat("Arquivos em cache:", length(zips), "| Tamanho total:",
+    format(round(sum(file.size(zips)) / 1024^2), big.mark = "."), "MB\n")
+```
+
+## Leitura dos boletins de urna
+
+Os CSV do TSE usam `;`, codificação Latin-1 e `#NULO#`/`#NE#` para faltantes. Os nomes de coluna esperados seguem o layout do BU de 2022 (a coluna do cargo é `CD_CARGO_PERGUNTA`, e o código aceita também `CD_CARGO`); se algum nome mudou em 2026, o erro indica o que faltou. Cada seção vira uma linha, com votos de cada candidato e o horário de encerramento.
+
+```{r}
+#| label: funcoes-leitura
+LOCALE_TSE <- locale(encoding = "latin1", decimal_mark = ",")
+
+norm_zona <- function(x) as.character(as.integer(x))   # remove zeros à esquerda
+
+extrair_csv <- function(zip) {
+  nomes <- unzip(zip, list = TRUE)$Name
+  csv   <- nomes[str_detect(nomes, regex("\\.csv$", ignore_case = TRUE))]
+  if (!length(csv)) stop("Nenhum CSV dentro de ", basename(zip))
+  exdir <- file.path(DIR_DADOS, "csv")
+  dir.create(exdir, showWarnings = FALSE, recursive = TRUE)
+  unzip(zip, files = csv, exdir = exdir, junkpaths = TRUE, overwrite = TRUE)
+  file.path(exdir, basename(csv))
+}
+
+ler_bu_csv <- function(csv) {
+  tipos <- cols(.default = col_character())
+  cab <- names(read_delim(csv, delim = ";", n_max = 0, locale = LOCALE_TSE,
+                          col_types = tipos, progress = FALSE))
+  cab_min <- str_to_lower(cab)
+
+  col_cargo    <- intersect(c("cd_cargo_pergunta", "cd_cargo"), cab_min)[1]
+  cols_horario <- intersect(unique(c(COLUNA_HORARIO, "dt_encerramento", "dt_emissao_bu")), cab_min)
+  basicas      <- c("sg_uf", "cd_municipio", "nm_municipio", "nr_zona", "nr_secao", "nr_votavel", "qt_votos")
+  faltam       <- setdiff(basicas, cab_min)
+
+  if (is.na(col_cargo) || !length(cols_horario) || length(faltam)) {
+    stop(glue("Layout inesperado em {basename(csv)}. ",
+              "Colunas básicas ausentes: {paste(faltam, collapse = ', ')}. ",
+              "Coluna de cargo encontrada: {col_cargo}. ",
+              "Colunas de horário encontradas: {paste(cols_horario, collapse = ', ')}. ",
+              "Colunas do arquivo: {paste(cab_min, collapse = ', ')}"))
+  }
+
+  usar <- cab[cab_min %in% c(basicas, "nr_turno", col_cargo, cols_horario)]
+  read_delim(csv, delim = ";", locale = LOCALE_TSE, col_types = tipos, col_select = all_of(usar),
+             na = c("", "#NULO#", "#NE#"), progress = FALSE) |>
+    rename_with(str_to_lower) |>
+    rename(cd_cargo = all_of(col_cargo))
+}
+
+resumir_secoes <- function(d) {
+  # coluna de horário: a configurada ou, se vazia, a próxima disponível
+  cands <- intersect(c(COLUNA_HORARIO, "dt_encerramento", "dt_emissao_bu"), names(d))
+  col_h <- cands[map_lgl(cands, \(c) any(!is.na(d[[c]])))][1]
+  if (is.na(col_h)) stop("Nenhuma coluna de horário está preenchida neste arquivo.")
+
+  if ("nr_turno" %in% names(d)) d <- filter(d, nr_turno == "2")
+
+  d |>
+    filter(cd_cargo == CD_CARGO_PRESIDENTE) |>
+    mutate(
+      qt_votos = as.numeric(qt_votos),
+      nr_zona  = norm_zona(nr_zona),
+      tipo = case_when(nr_votavel == NR_CAND_A ~ "A",
+                       nr_votavel == NR_CAND_B ~ "B",
+                       TRUE ~ "outros"),   # 95 = branco, 96 = nulo
+      # hora "de relógio" (sem fuso); o fuso é tratado depois, por UF
+      dt_naive = parse_date_time(.data[[col_h]],
+                                 orders = c("dmY HMS", "dmY HM", "Ymd HMS", "Ymd HM"),
+                                 tz = "UTC", quiet = TRUE)
+    ) |>
+    # 1 linha por seção (soma BUs duplicados, p.ex. urnas de contingência)
+    group_by(sg_uf, cd_municipio, nm_municipio, nr_zona, nr_secao) |>
+    summarise(
+      dt_enc_naive = suppressWarnings(max(dt_naive, na.rm = TRUE)),
+      votos_a = sum(qt_votos[tipo == "A"]),
+      votos_b = sum(qt_votos[tipo == "B"]),
+      .groups = "drop"
+    ) |>
+    mutate(dt_enc_naive = replace(dt_enc_naive, is.infinite(dt_enc_naive), NA),
+           validos = votos_a + votos_b,
+           coluna_horario = col_h)
+}
+
+ler_zip_bu <- function(zip) {
+  cat("Lendo", basename(zip), "...\n")
+  csvs <- extrair_csv(zip)
+  on.exit(if (APAGAR_CSV_EXTRAIDO) unlink(csvs), add = TRUE)
+  map_dfr(csvs, \(csv) resumir_secoes(ler_bu_csv(csv)))
+}
+```
+
+```{r}
+#| label: ler-bu
+secoes_naive <- map_dfr(zips, ler_zip_bu)
+secoes_naive |> count(coluna_horario) |> knitr::kable(col.names = c("Coluna de horário usada", "Seções"))
+```
+
+## Fuso horário
+
+Dependendo da UF, o arquivo pode guardar o horário **local** em vez do de Brasília (AC está 2 h atrás de Brasília; AM, RO, RR, MT e MS, 1 h). Com `HORARIO_NO_ARQUIVO <- "auto"`, o código compara a mediana do horário bruto dessas UFs com as 17h00: se a mediana cai perto de 17h00 menos a defasagem (por exemplo, ~15h00 no Acre), a hora é tratada como local e convertida para Brasília. A decisão por UF aparece na tabela.
+
+```{r}
+#| label: fuso
+DEFASAGEM_H <- c(AC = 2, AM = 1, RO = 1, RR = 1, MT = 1, MS = 1)  # horas atrás de Brasília; demais UFs = 0
+
+ajustar_fuso <- function(s) {
+  limite_naive <- force_tz(LIMITE_FECHAMENTO, "UTC")   # 17h00 "de relógio"
+  def <- tibble(sg_uf = names(DEFASAGEM_H), def_h = unname(DEFASAGEM_H))
+
+  decisao <- s |>
+    mutate(min_naive = as.numeric(difftime(dt_enc_naive, limite_naive, units = "mins"))) |>
+    inner_join(def, by = "sg_uf") |>
+    group_by(sg_uf, def_h) |>
+    summarise(mediana_min = median(min_naive, na.rm = TRUE), .groups = "drop") |>
+    mutate(hora_local = case_when(
+      HORARIO_NO_ARQUIVO == "local_uf"  ~ TRUE,
+      HORARIO_NO_ARQUIVO == "brasilia"  ~ FALSE,
+      TRUE ~ abs(mediana_min + 60 * def_h) < abs(mediana_min)   # "auto"
+    ))
+
+  out <- s |>
+    left_join(select(decisao, sg_uf, def_h, hora_local), by = "sg_uf") |>
+    mutate(ajuste_h = if_else(coalesce(hora_local, FALSE), def_h, 0),
+           dt_enc_brasilia = force_tz(dt_enc_naive + dhours(ajuste_h), "America/Sao_Paulo")) |>
+    select(-def_h, -hora_local, -ajuste_h, -dt_enc_naive)
+
+  list(secoes = out, decisao = decisao)
+}
+
+ajuste <- ajustar_fuso(secoes_naive)
+secoes <- ajuste$secoes
+
+ajuste$decisao |>
+  transmute(UF = sg_uf, `Mediana do horário bruto (min após 17h00)` = mediana_min,
+            `Interpretado como` = if_else(hora_local, "hora local (convertida p/ Brasília)", "hora de Brasília")) |>
+  knitr::kable(digits = 0)
+```
+
+## Conferência
+
+Compare estes totais com o resultado oficial em <https://resultados.tse.jus.br>. Eles só batem se todas as UFs foram carregadas e se `INCLUIR_EXTERIOR` for `TRUE` (o voto no exterior fica de fora por padrão). Diferenças pequenas por seções ainda não totalizadas no momento da geração dos arquivos também são esperadas.
+
+```{r}
+#| label: conferencia
+secoes |>
+  summarise(Seções = n(),
+            `Sem horário válido` = sum(is.na(dt_enc_brasilia)),
+            `Votos A` = sum(votos_a), `Votos B` = sum(votos_b)) |>
+  mutate(`% A (válidos)` = 100 * `Votos A` / (`Votos A` + `Votos B`),
+         `% B (válidos)` = 100 * `Votos B` / (`Votos A` + `Votos B`)) |>
+  knitr::kable(digits = 2, format.args = list(big.mark = ".", decimal.mark = ","))
+cat("A = ", NM_A, " | B = ", NM_B, "\n", sep = "")
+glimpse(secoes)
+```
+
+# Encerramento das urnas após as 17h
+
+## Horário de fechamento de cada seção {#sec-diagnostico}
+
+Antes de classificar as seções, olhe a distribuição real dos horários. Os gráficos abaixo mostram, de quatro formas, **quando cada seção eleitoral foi encerrada** (horário de Brasília): histograma minuto a minuto, curva acumulada, cada seção como um ponto (tamanho da seção × horário) e a distribuição por UF.
+
+Dois diagnósticos de qualidade dos dados: (i) se UFs de outros fusos (AC, AM, RO, RR, MT, MS) aparecerem deslocadas em 1–2 horas nos gráficos por UF, a conversão de fuso falhou: force `HORARIO_NO_ARQUIVO` para `"local_uf"` ou `"brasilia"`; (ii) se quase todas as seções estiverem logo após as 17h00, o corte estrito às 17h00 separa pouco as seções e o grupo "até 17h00" será pequeno e atípico.
+
+```{r}
+#| label: p2-prep
+secoes <- secoes |>
+  mutate(min_apos_17 = as.numeric(difftime(dt_enc_brasilia, LIMITE_FECHAMENTO, units = "mins")))
+
+cat("Seções sem horário válido (excluídas desta parte):", sum(is.na(secoes$dt_enc_brasilia)), "\n")
+
+secoes_h    <- filter(secoes, !is.na(dt_enc_brasilia))
+JANELA_INI  <- LIMITE_FECHAMENTO - dhours(2)
+JANELA_FIM  <- LIMITE_FECHAMENTO + dhours(4)
+```
+
+### Histograma: seções encerradas a cada minuto
+
+```{r}
+#| label: p2-grafico-histograma
+#| fig-width: 9
+#| fig-height: 4.8
+ggplot(secoes_h, aes(dt_enc_brasilia)) +
+  geom_histogram(binwidth = 60, fill = "steelblue") +          # 1 barra = 1 minuto
+  geom_vline(xintercept = as.numeric(LIMITE_FECHAMENTO), linetype = "dashed", colour = "firebrick") +
+  scale_x_datetime(date_labels = "%H:%M", date_breaks = "30 min", timezone = "America/Sao_Paulo") +
+  scale_y_continuous(labels = scales::label_number(big.mark = ".", decimal.mark = ",")) +
+  coord_cartesian(xlim = c(JANELA_INI, JANELA_FIM)) +
+  labs(title = "Horário de encerramento das seções eleitorais — 2º turno 2026",
+       x = "Horário de Brasília (linha tracejada = 17h00)", y = "Seções encerradas por minuto")
+```
+
+### Curva acumulada
+
+```{r}
+#| label: p2-grafico-ecdf
+#| fig-width: 9
+#| fig-height: 4.8
+ggplot(secoes_h, aes(dt_enc_brasilia)) +
+  stat_ecdf(geom = "step", colour = "steelblue", linewidth = .9) +
+  geom_vline(xintercept = as.numeric(LIMITE_FECHAMENTO), linetype = "dashed", colour = "firebrick") +
+  scale_x_datetime(date_labels = "%H:%M", date_breaks = "30 min", timezone = "America/Sao_Paulo") +
+  scale_y_continuous(labels = scales::label_percent(), breaks = seq(0, 1, .1)) +
+  coord_cartesian(xlim = c(JANELA_INI, JANELA_FIM)) +
+  labs(title = "Percentual acumulado de seções já encerradas ao longo da tarde",
+       x = "Horário de Brasília (linha tracejada = 17h00)", y = "% acumulado de seções")
+
+pontos_min <- c(0, 5, 15, 30, 60, 120)
+tibble(`Encerradas até (min após 17h00)` = pontos_min,
+       `% acumulado de seções` = map_dbl(pontos_min, \(m) 100 * mean(secoes_h$min_apos_17 <= m))) |>
+  knitr::kable(digits = 1, format.args = list(decimal.mark = ","))
+```
+
+### Cada seção como um ponto
+
+Uma amostra aleatória de até 20 mil seções (para o gráfico não ficar ilegível), com o tamanho da seção (votos válidos) no eixo vertical. Serve para ver se as seções que fecham mais tarde são também as maiores.
+
+```{r}
+#| label: p2-grafico-pontos
+#| fig-width: 9
+#| fig-height: 5
+set.seed(2026)
+amostra <- slice_sample(secoes_h, n = min(20000, nrow(secoes_h)))
+
+ggplot(amostra, aes(dt_enc_brasilia, validos)) +
+  geom_point(alpha = .15, size = .7, colour = "steelblue") +
+  geom_vline(xintercept = as.numeric(LIMITE_FECHAMENTO), linetype = "dashed", colour = "firebrick") +
+  scale_x_datetime(date_labels = "%H:%M", date_breaks = "30 min", timezone = "America/Sao_Paulo") +
+  coord_cartesian(xlim = c(JANELA_INI, JANELA_FIM)) +
+  labs(title = "Horário de encerramento × tamanho da seção (amostra de seções)",
+       x = "Horário de Brasília (linha tracejada = 17h00)", y = "Votos válidos na seção")
+```
+
+### Distribuição por UF
+
+```{r}
+#| label: p2-grafico-uf
+#| fig-width: 9
+#| fig-height: 7
+ggplot(secoes_h, aes(x = reorder(sg_uf, min_apos_17, FUN = median), y = min_apos_17)) +
+  geom_boxplot(outlier.shape = NA, fill = "steelblue", alpha = .5) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "firebrick") +
+  coord_flip(ylim = c(-30, 120)) +
+  labs(title = "Minutos após as 17h00 até o encerramento, por UF",
+       x = NULL, y = "Minutos após as 17h00 (negativo = encerrou antes)")
+
+secoes_h |>
+  group_by(UF = sg_uf) |>
+  summarise(`Seções` = n(),
+            `Mediana (min após 17h)` = median(min_apos_17),
+            `% encerradas > 17h30` = 100 * mean(min_apos_17 > 30)) |>
+  knitr::kable(digits = 1, format.args = list(big.mark = ".", decimal.mark = ","))
+```
+
+## Classificação das seções
+
+```{r}
+#| label: p2-classificar
+classificar_encerramento <- function(dt, tolerancia_min = 0) {
+  limite <- LIMITE_FECHAMENTO + dminutes(tolerancia_min)
+  factor(if_else(dt <= limite, GRUPOS[1], GRUPOS[2]), levels = GRUPOS)
+}
+
+secoes <- secoes |>
+  mutate(grupo = classificar_encerramento(dt_enc_brasilia, TOLERANCIA_MIN))
+
+secoes |> count(grupo) |> mutate(`%` = 100 * n / sum(n)) |>
+  knitr::kable(digits = 1, format.args = list(big.mark = ".", decimal.mark = ","))
+```
+
+::: {.callout-warning}
+## Cuidado com o corte estrito às 17h00
+A urna normalmente só permite encerrar a votação depois das 17h, a menos que todos os eleitores aptos já tenham votado. Se for o caso nos seus dados, o grupo "até 17h00" será formado sobretudo por seções pequenas ou atípicas, e comparar "até" com "após" vira comparar tipos de seção, não efeito de fila. A @sec-sensibilidade testa cortes com tolerância (15, 30, 60 min) para separar fechamento de rotina de fechamento por fila.
+:::
+
+## Percentual de votos válidos por grupo e testes
+
+```{r}
+#| label: p2-resumo
+resumo_grupo <- secoes |>
+  filter(!is.na(grupo)) |>
+  group_by(grupo) |>
+  summarise(secoes = n(), validos = sum(validos), votos_a = sum(votos_a), votos_b = sum(votos_b),
+            pct_a = 100 * votos_a / validos, pct_b = 100 * votos_b / validos)
+
+stopifnot("Um dos grupos está vazio: ajuste TOLERANCIA_MIN ou verifique os horários." = nrow(resumo_grupo) == 2)
+
+resumo_grupo |>
+  knitr::kable(digits = 2, format.args = list(big.mark = ".", decimal.mark = ","),
+               col.names = c("Grupo", "Seções", "Votos válidos", paste("Votos", NM_A), paste("Votos", NM_B),
+                             paste("%", NM_A), paste("%", NM_B)))
+```
+
+### Teste qui-quadrado (agregado, sem controle geográfico)
+
+```{r}
+#| label: p2-quiquadrado
+tab_2x2 <- as.matrix(select(resumo_grupo, votos_a, votos_b))
+dimnames(tab_2x2) <- list(as.character(resumo_grupo$grupo), c(NM_A, NM_B))
+
+qui <- chisq.test(tab_2x2)
+
+g_ate  <- filter(resumo_grupo, grupo == GRUPOS[1])
+g_apos <- filter(resumo_grupo, grupo == GRUPOS[2])
+pp <- prop.test(x = c(g_apos$votos_a, g_ate$votos_a), n = c(g_apos$validos, g_ate$validos))
+
+tibble(
+  Teste = "Qui-quadrado (votos agregados)",
+  `Dif. em % de A (após − até), p.p.` = 100 * unname(pp$estimate[1] - pp$estimate[2]),
+  `IC 95% inf.` = 100 * pp$conf.int[1], `IC 95% sup.` = 100 * pp$conf.int[2],
+  `p-valor` = qui$p.value
+) |> knitr::kable(digits = 3, format.args = list(decimal.mark = ","))
+```
+
+::: {.callout-caution}
+O qui-quadrado trata cada voto como observação independente. Com milhões de votos, qualquer diferença minúscula fica "significativa", e votos na mesma seção/município são correlacionados. Por isso o resultado acima é só ponto de partida; os testes com controle por UF e erros agrupados (@sec-controle) são mais confiáveis.
+:::
+
+### Teste t (nível de seção)
+
+```{r}
+#| label: p2-teste-t
+secoes_pct <- secoes |> filter(!is.na(grupo), validos > 0) |> mutate(pct_a = 100 * votos_a / validos)
+
+tt <- t.test(pct_a ~ grupo, data = secoes_pct)   # Welch
+tibble(
+  Teste = "t de Welch (% de A por seção, sem ponderar)",
+  `Dif. (após − até), p.p.` = unname(tt$estimate[2] - tt$estimate[1]),
+  `IC 95% inf.` = -tt$conf.int[2], `IC 95% sup.` = -tt$conf.int[1],
+  `p-valor` = tt$p.value
+) |> knitr::kable(digits = 3, format.args = list(decimal.mark = ","))
+```
+
+## Controle geográfico (UF) para evitar viés ecológico {#sec-controle}
+
+Se as filas se concentram em UFs onde um candidato é mais forte, a comparação agregada confunde "estar na fila" com "estar naquela UF". Três formas de controlar:
+
+**(a) Diferença dentro de cada UF**, com correção de múltiplos testes (Holm):
+
+```{r}
+#| label: p2-por-uf
+#| fig-width: 8
+#| fig-height: 6
+por_uf <- secoes |>
+  filter(!is.na(grupo)) |>
+  mutate(g = if_else(grupo == GRUPOS[2], "apos", "ate")) |>
+  group_by(sg_uf, g) |>
+  summarise(secoes = n(), validos = sum(validos), votos_a = sum(votos_a), .groups = "drop") |>
+  pivot_wider(names_from = g, values_from = c(secoes, validos, votos_a), values_fill = 0)
+
+tab_uf <- por_uf |>
+  filter(secoes_ate >= MIN_SECOES_GRUPO, secoes_apos >= MIN_SECOES_GRUPO) |>
+  rowwise() |>
+  mutate(pct_a_ate  = 100 * votos_a_ate / validos_ate,
+         pct_a_apos = 100 * votos_a_apos / validos_apos,
+         dif_pp     = pct_a_apos - pct_a_ate,
+         p_valor    = prop.test(c(votos_a_apos, votos_a_ate), c(validos_apos, validos_ate))$p.value) |>
+  ungroup() |>
+  mutate(p_holm = p.adjust(p_valor, method = "holm"))
+
+stopifnot("Nenhuma UF com seções suficientes nos dois grupos; reduza MIN_SECOES_GRUPO ou mude o corte." = nrow(tab_uf) > 0)
+
+tab_uf |>
+  select(UF = sg_uf, `Seções até` = secoes_ate, `Seções após` = secoes_apos,
+         `% A até` = pct_a_ate, `% A após` = pct_a_apos, `Dif. (p.p.)` = dif_pp,
+         `p-valor` = p_valor, `p Holm` = p_holm) |>
+  knitr::kable(digits = 3, format.args = list(big.mark = ".", decimal.mark = ","))
+
+ggplot(tab_uf, aes(dif_pp, reorder(sg_uf, dif_pp), colour = p_holm < ALFA)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_point(size = 2.5) +
+  scale_colour_manual(values = c(`TRUE` = "firebrick", `FALSE` = "grey50"),
+                      labels = c(`TRUE` = "Significativo (Holm)", `FALSE` = "Não significativo")) +
+  labs(title = glue("Diferença em % de válidos de {NM_A}: encerradas após − até 17h00, por UF"),
+       x = "Pontos percentuais", y = NULL, colour = NULL)
+```
+
+**(b) Teste de Cochran–Mantel–Haenszel**, que combina as tabelas 2×2 de todas as UFs numa única razão de chances comum:
+
+```{r}
+#| label: p2-cmh
+long_uf <- secoes |>
+  filter(!is.na(grupo), sg_uf %in% tab_uf$sg_uf) |>
+  group_by(sg_uf, grupo) |>
+  summarise(A = sum(votos_a), B = sum(votos_b), .groups = "drop") |>
+  pivot_longer(c(A, B), names_to = "candidato", values_to = "votos")
+
+tab3d <- xtabs(votos ~ grupo + candidato + sg_uf, data = long_uf)
+cmh   <- mantelhaen.test(tab3d)
+
+tibble(
+  Teste = "Cochran–Mantel–Haenszel (estratos = UF)",
+  `Razão de chances A:B (após vs. até)` = 1 / unname(cmh$estimate),
+  `IC 95% inf.` = 1 / cmh$conf.int[2], `IC 95% sup.` = 1 / cmh$conf.int[1],
+  `p-valor` = cmh$p.value
+) |> knitr::kable(digits = 4, format.args = list(decimal.mark = ","))
+```
+
+**(c) Regressão ponderada com efeito fixo de UF e erros-padrão agrupados por município** (a mais conservadora das três; compara com e sem o controle):
+
+```{r}
+#| label: p2-regressao
+dados_reg <- secoes |>
+  filter(!is.na(grupo), validos > 0) |>
+  mutate(pct_a = 100 * votos_a / validos,
+         apos17 = as.integer(grupo == GRUPOS[2]))
+
+coef_agrupado <- function(modelo, cluster) {
+  ct <- coeftest(modelo, vcov. = vcovCL(modelo, cluster = cluster))
+  tibble(`Efeito (p.p.)` = ct["apos17", 1], `EP agrupado` = ct["apos17", 2], `p-valor` = ct["apos17", 4])
+}
+
+m_sem <- lm(pct_a ~ apos17,                    data = dados_reg, weights = validos)
+m_uf  <- lm(pct_a ~ apos17 + factor(sg_uf),    data = dados_reg, weights = validos)
+
+bind_rows(
+  `Sem controle geográfico`  = coef_agrupado(m_sem, dados_reg$cd_municipio),
+  `Com efeito fixo de UF`    = coef_agrupado(m_uf,  dados_reg$cd_municipio),
+  .id = "Modelo"
+) |> knitr::kable(digits = 3, format.args = list(decimal.mark = ","))
+```
+
+```{r}
+#| label: p2-fe-municipio
+# Opcional: controle ainda mais fino (efeito fixo de município). Requer o pacote 'fixest'.
+if (requireNamespace("fixest", quietly = TRUE)) {
+  m_mun <- fixest::feols(pct_a ~ apos17 | cd_municipio, data = dados_reg,
+                         weights = ~validos, cluster = ~cd_municipio)
+  print(summary(m_mun))
+} else {
+  cat("Instale 'fixest' (install.packages(\"fixest\")) para rodar o modelo com efeito fixo de município.\n")
+}
+```
+
+```{r}
+#| label: p2-leitura
+#| results: asis
+ct_uf <- coef_agrupado(m_uf, dados_reg$cd_municipio)
+cat(glue(
+  "**Leitura automática.** Controlando a UF, seções encerradas após o corte tiveram, em média, ",
+  "**{fmt(ct_uf$`Efeito (p.p.)`)} p.p.** de diferença no percentual de válidos de {NM_A} ",
+  "(p = {fmt_p(ct_uf$`p-valor`)}). ",
+  "{if (ct_uf$`p-valor` < ALFA) 'Diferença estatisticamente significativa' else 'Diferença não significativa'} ",
+  "ao nível de {ALFA * 100}%. Diferença de composição entre seções (tamanho, urbanização, perfil) ",
+  "não é evidência de irregularidade: votar na fila às 17h é um direito."
+))
+```
+
+## Sensibilidade ao ponto de corte {#sec-sensibilidade}
+
+```{r}
+#| label: p2-sensibilidade
+efeito_corte <- function(tol) {
+  d <- dados_reg |> mutate(apos17 = as.integer(dt_enc_brasilia > LIMITE_FECHAMENTO + dminutes(tol)))
+  if (n_distinct(d$apos17) < 2) return(tibble(tolerancia_min = tol))
+  m  <- lm(pct_a ~ apos17 + factor(sg_uf), data = d, weights = validos)
+  ct <- coeftest(m, vcov. = vcovCL(m, cluster = d$cd_municipio))
+  tibble(
+    tolerancia_min = tol,
+    secoes_apos    = sum(d$apos17),
+    pct_secoes_apos = 100 * mean(d$apos17),
+    dif_bruta_pp   = weighted.mean(d$pct_a[d$apos17 == 1], d$validos[d$apos17 == 1]) -
+                     weighted.mean(d$pct_a[d$apos17 == 0], d$validos[d$apos17 == 0]),
+    efeito_uf_pp   = ct["apos17", 1],
+    p_valor        = ct["apos17", 4]
+  )
+}
+
+map_dfr(c(0, 15, 30, 60), efeito_corte) |>
+  knitr::kable(digits = 3, format.args = list(big.mark = ".", decimal.mark = ","),
+               col.names = c("Tolerância (min)", "Seções após o corte", "% das seções",
+                             "Dif. bruta (p.p.)", "Efeito com FE de UF (p.p.)", "p-valor"))
+```
+
+Se o efeito muda de sinal ou de significância conforme o corte, a conclusão depende da definição de "após as 17h". Cortes de 15–60 minutos isolam melhor as seções com fila real.
+
+## Isso altera o resultado total?
+
+Dois limites, calculados sobre todas as seções com horário válido:
+
+1. **Exclusão total:** qual seria a margem se todas as seções "após" fossem descartadas? Se o sinal da margem não muda, nem a retirada integral dessas seções alteraria o vencedor.
+2. **Contrafactual de composição:** e se as seções "após" tivessem votado como as seções "até" da mesma UF? É um exercício de sensibilidade, não causal.
+
+```{r}
+#| label: p2-impacto
+tot <- secoes |> summarise(a = sum(votos_a, na.rm = TRUE), b = sum(votos_b, na.rm = TRUE))
+tar <- secoes |> filter(grupo == GRUPOS[2]) |>
+  summarise(a = sum(votos_a), b = sum(votos_b), validos = sum(validos), n = n())
+
+margem_total        <- tot$a - tot$b
+margem_sem_tardias  <- (tot$a - tar$a) - (tot$b - tar$b)
+
+ref_uf <- secoes |> filter(grupo == GRUPOS[1]) |>
+  group_by(sg_uf) |> summarise(p_a_ref = sum(votos_a) / sum(validos))
+
+cf <- secoes |> filter(grupo == GRUPOS[2]) |>
+  inner_join(ref_uf, by = "sg_uf") |>
+  summarise(margem_obs = sum(votos_a - votos_b),
+            margem_cf  = sum(validos * (2 * p_a_ref - 1)))
+
+tibble(
+  Medida = c("Margem total (A − B) com todas as seções",
+             "Margem sem as seções encerradas após o corte",
+             "Margem dessas seções, observada",
+             "Margem dessas seções se votassem como as 'até' da UF",
+             "Variação da margem nacional no contrafactual"),
+  Votos = c(margem_total, margem_sem_tardias, cf$margem_obs, cf$margem_cf, cf$margem_cf - cf$margem_obs)
+) |> knitr::kable(digits = 0, format.args = list(big.mark = ".", decimal.mark = ","))
+
+cat(glue("\nO sinal da margem se mantém ao excluir as seções 'após'? ",
+         "{if (sign(margem_total) == sign(margem_sem_tardias)) 'SIM' else 'NÃO'}. ",
+         "O contrafactual de composição inverteria o vencedor? ",
+         "{if (sign(margem_total + cf$margem_cf - cf$margem_obs) != sign(margem_total)) 'SIM' else 'NÃO'}."))
+```
+
+# Limitações e checklist
+
+**Limitações**
+
+* **Falácia ecológica:** diferenças entre grupos de seções não valem automaticamente para indivíduos; por isso o controle por UF e por município.
+* **Variáveis omitidas:** tamanho da seção, urbanização, perfil do eleitorado e logística local afetam fila e voto. O efeito estimado é uma associação, não causalidade.
+* **Horário de encerramento:** reflete o procedimento da mesa (fila, fechamento manual), não só o momento do último voto. Votar na fila às 17h é um direito.
+* **Testes com muitos dados:** p-valores minúsculos com milhões de votos não implicam diferenças relevantes; olhe sempre o tamanho do efeito e o IC.
+* **Fusos:** a conversão automática é uma heurística (mediana por UF); confira a tabela de decisão e os gráficos de @sec-diagnostico. Fernando de Noronha (PE) tem fuso próprio e não foi tratado separadamente.
+* **Cobertura:** "margem total" neste documento é a das seções carregadas (por padrão, sem o exterior), não necessariamente o resultado oficial nacional.
+* **Arquivos parciais:** o TSE pode republicar os ZIPs durante a totalização; use `FORCAR_DOWNLOAD <- TRUE` para atualizar o cache.
+
+**Para rodar**
+
+1. Instale os pacotes listados na seção de configuração.
+2. Renderize: `quarto render analise_fechamento_urnas_2t_2026.qmd`. O primeiro download pode demorar.
+3. Se aparecer "Arquivos do 2º turno não encontrados", os dados ainda não foram publicados (ou a consulta automática falhou: use `URLS_MANUAIS`).
+4. Se aparecer "Layout inesperado", a mensagem lista as colunas do arquivo; ajuste os nomes em `ler_bu_csv()`.
+5. Veja a conferência de totais e os gráficos de horário (@sec-diagnostico) **antes** de interpretar os testes.
+
+```{r}
+#| label: sessao
+sessionInfo()
+```
